@@ -1,0 +1,6 @@
+streamlit
+pandas
+openpyxl
+requests
+mysql-connector-python
+python-dotenv
