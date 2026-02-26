@@ -28,12 +28,13 @@ BASE_URL = "https://mum-objectstore.e2enetworks.net/production-finqy/"
 OUTPUT_FILE = "processed_trade_lines.xlsx"
 MAX_WORKERS = 20  # Number of parallel threads
 
-# Target Headers (31 Columns)
+# Target Headers (36 Columns)
 TARGET_HEADERS = [
     'pan', 'fiName', 'creditLineType', 'totalSanctionedAmount', 'currentOutstanding', 
-    'status', 'paidPrincipalAmount', 'EMI', 'totalTenure', 'pendingTenure', 
+    'status', 'SuitFiled', 'SuitFiledStatus', 'WrittenOffFlag', 'WrittenOffAmount',
+    'paidPrincipalAmount', 'EMI', 'totalTenure', 'pendingTenure', 
     'startDate', 'Balance', 'lastPaymentDate', 'lastPaymentAmount', 
-    'accountPastDueAmount', 'totalDelinquencies', 'delinquencies', 
+    'accountPastDueAmount', 'OverdueAmount', 'totalDelinquencies', 'delinquencies', 
     'delinquencies30Days', 'delinquencies60Days', 'delinquencies90Days', 
     'Recent_Missed_30DPD', 'Recent_Missed_60DPD', 'Recent_Missed_90DPD', 
     'Enq_30Days', 'Enq_60Days', 'Enq_90Days', 'Enq_1Year', 
@@ -56,6 +57,14 @@ def clean_money(val):
 def clean_str(val):
     if not val: return None
     return str(val).replace('*', '').strip()
+
+def clean_nullable_str(val):
+    if val is None:
+        return None
+    s_val = str(val).replace('*', '').strip()
+    if s_val == '' or s_val.lower() == 'null':
+        return None
+    return s_val
 
 def calculate_enquiries(enquiries_list, days):
     if not enquiries_list:
@@ -154,6 +163,49 @@ def get_delinquency_buckets(payment_history):
     stats['delinquencies'] = ",".join(stats['delinquencies'])
     return stats
 
+def get_suit_filed_info(payment_history):
+    if not isinstance(payment_history, list) or len(payment_history) == 0:
+        return "No", None
+
+    dated_statuses = []
+    undated_status = None
+
+    for rec in payment_history:
+        if not isinstance(rec, dict):
+            continue
+        suit_status = clean_nullable_str(rec.get('suitFiledStatus'))
+        if not suit_status:
+            continue
+
+        month_str = rec.get('month')
+        try:
+            parsed_month = datetime.strptime(month_str, '%m-%y')
+            dated_statuses.append((parsed_month, suit_status))
+        except Exception:
+            if undated_status is None:
+                undated_status = suit_status
+
+    if dated_statuses:
+        dated_statuses.sort(key=lambda x: x[0], reverse=True)
+        return "Yes", dated_statuses[0][1]
+
+    if undated_status:
+        return "Yes", undated_status
+
+    return "No", None
+
+def get_written_off_info(account, status_raw=None):
+    written_off_amount = clean_money(account.get('writtenOffAmtTotal'))
+    if written_off_amount <= 0:
+        fallback_amt = clean_money(account.get('noWriteOff'))
+        if fallback_amt > 0:
+            written_off_amount = fallback_amt
+
+    status_text = (status_raw or clean_str(account.get('accountStatus')) or '').upper()
+    is_written_off = written_off_amount > 0 or ('WRITTEN' in status_text and 'OFF' in status_text)
+
+    return ("Yes" if is_written_off else "No"), written_off_amount
+
 # ==========================================
 # CORE PROCESSING LOGIC (Single JSON Record)
 # ==========================================
@@ -202,21 +254,38 @@ def process_single_record(data_obj, pan_from_db=None):
 
         # ACCOUNTS
         all_accounts = []
-        all_accounts.extend(credit_analysis.get('creditCards', []))
+
+        credit_cards = credit_analysis.get('creditCards', [])
+        if isinstance(credit_cards, list):
+            all_accounts.extend(credit_cards)
+
         loans_data = credit_analysis.get('loans', {})
         if isinstance(loans_data, dict):
-            for key, val in loans_data.items():
-                if isinstance(val, list): all_accounts.extend(val)
+            for _, val in loans_data.items():
+                if isinstance(val, list):
+                    all_accounts.extend(val)
         elif isinstance(loans_data, list):
-             all_accounts.extend(loans_data)
-        
+            all_accounts.extend(loans_data)
+
+        # Newer report payloads place many consumer/retail tradelines here.
+        other_loans = credit_analysis.get('otherLoans', [])
+        if isinstance(other_loans, list):
+            all_accounts.extend(other_loans)
+
         others = credit_analysis.get('others', {})
         if isinstance(others, dict):
-            all_accounts.extend(others.get('overdraft', []))
+            overdraft_accounts = others.get('overdraft', [])
+            if isinstance(overdraft_accounts, list):
+                all_accounts.extend(overdraft_accounts)
         
         if not all_accounts:
              row = {header: None for header in TARGET_HEADERS}
              row['pan'] = pan
+             row['SuitFiled'] = "No"
+             row['SuitFiledStatus'] = None
+             row['WrittenOffFlag'] = "No"
+             row['WrittenOffAmount'] = 0
+             row['OverdueAmount'] = 0
              row['Enq_30Days'] = enq_30
              row['Enq_60Days'] = enq_60
              row['Enq_90Days'] = enq_90
@@ -230,7 +299,9 @@ def process_single_record(data_obj, pan_from_db=None):
         for account in all_accounts:
             if not isinstance(account, dict): continue
 
-            delinq_stats = get_delinquency_buckets(account.get('paymentHistory', []))
+            payment_history = account.get('paymentHistory', [])
+            delinq_stats = get_delinquency_buckets(payment_history)
+            suit_filed_flag, suit_filed_status = get_suit_filed_info(payment_history)
             
             total_tenure_raw = account.get('repaymentTenure')
             open_date_raw = account.get('accountOpenDate')
@@ -246,6 +317,8 @@ def process_single_record(data_obj, pan_from_db=None):
                  paid_principal = max(0, sanctioned_amt - outstanding_amt)
             
             status_raw = clean_str(account.get('accountStatus'))
+            written_off_flag, written_off_amount = get_written_off_info(account, status_raw=status_raw)
+            overdue_amount = clean_money(account.get('accountPastDueAmount'))
             close_date_raw = account.get('accountCloseDate')
             
             settled30, settled60, settled90 = 0, 0, 0
@@ -266,6 +339,10 @@ def process_single_record(data_obj, pan_from_db=None):
                 'totalSanctionedAmount': sanctioned_amt,
                 'currentOutstanding': outstanding_amt,
                 'status': status_raw,
+                'SuitFiled': suit_filed_flag,
+                'SuitFiledStatus': suit_filed_status,
+                'WrittenOffFlag': written_off_flag,
+                'WrittenOffAmount': written_off_amount,
                 'paidPrincipalAmount': paid_principal,
                 'EMI': clean_money(account.get('emi')),
                 'totalTenure': clean_str(total_tenure_raw),
@@ -274,7 +351,8 @@ def process_single_record(data_obj, pan_from_db=None):
                 'Balance': outstanding_amt,
                 'lastPaymentDate': clean_str(account.get('lastPaymentDate')),
                 'lastPaymentAmount': clean_money(account.get('lastPaymentAmount')),
-                'accountPastDueAmount': clean_money(account.get('accountPastDueAmount')),
+                'accountPastDueAmount': overdue_amount,
+                'OverdueAmount': overdue_amount,
                 'totalDelinquencies': delinq_stats['totalDelinquencies'],
                 'delinquencies': delinq_stats['delinquencies'],
                 'delinquencies30Days': delinq_stats['delinq30'],
@@ -287,7 +365,7 @@ def process_single_record(data_obj, pan_from_db=None):
                 'Enq_60Days': enq_60,
                 'Enq_90Days': enq_90,
                 'Enq_1Year': enq_365,
-                'currentDpd': clean_money(account.get('accountPastDueAmount')),
+                'currentDpd': overdue_amount,
                 'settledLast30Days': settled30,
                 'settledLast60Days': settled60,
                 'settledLast90Days': settled90
