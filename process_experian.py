@@ -206,6 +206,443 @@ def get_written_off_info(account, status_raw=None):
 
     return ("Yes" if is_written_off else "No"), written_off_amount
 
+def parse_flexible_date(val):
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%d")
+
+    s_val = str(val).strip()
+    if not s_val or s_val.lower() == 'null':
+        return None
+
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y%m%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            parsed = datetime.strptime(s_val, fmt)
+            if fmt == "%Y-%m":
+                parsed = parsed.replace(day=1)
+            return parsed.strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    if "T" in s_val:
+        return parse_flexible_date(s_val.split("T", 1)[0])
+    return s_val
+
+def _build_in_clause(values):
+    return ", ".join(["%s"] * len(values))
+
+def get_enquiry_summary_count(summary, *keys):
+    if not isinstance(summary, dict):
+        return None
+    for key in keys:
+        if key not in summary:
+            continue
+        val = summary.get(key)
+        try:
+            if val is None or str(val).strip() == '':
+                continue
+            return int(float(str(val).replace(',', '').strip()))
+        except Exception:
+            continue
+    return None
+
+def normalize_api_suit_filed_status(val):
+    status = clean_nullable_str(val)
+    if not status:
+        return None
+    if status in {'0', '00', '000', 'N', 'NO'}:
+        return None
+    return status
+
+def normalize_api_payment_history(payment_history, suit_filed_status=None):
+    normalized = []
+
+    for idx, rec in enumerate(payment_history or []):
+        if not isinstance(rec, dict):
+            continue
+
+        month_str = None
+        date_val = rec.get('date') or rec.get('month')
+        if date_val:
+            date_str = str(date_val).strip()
+            for fmt in ("%Y-%m", "%Y-%m-%d", "%m-%y"):
+                try:
+                    parsed = datetime.strptime(date_str, fmt)
+                    month_str = parsed.strftime("%m-%y")
+                    break
+                except Exception:
+                    continue
+        if not month_str:
+            continue
+
+        days_late = clean_money(rec.get('daysLate'))
+        if days_late > 0:
+            status = str(int(days_late))
+        else:
+            status_token = clean_nullable_str(rec.get('status')) or clean_nullable_str(rec.get('assetClassification'))
+            status_upper = status_token.upper() if status_token else ''
+            if status_upper in {'S', 'STD', 'STANDARD', 'CURRENT', '?', '0'}:
+                status = '0'
+            else:
+                status = status_token or '0'
+
+        entry = {'month': month_str, 'status': status}
+        if idx == 0 and suit_filed_status:
+            entry['suitFiledStatus'] = suit_filed_status
+        normalized.append(entry)
+
+    if suit_filed_status and not normalized:
+        normalized.append({
+            'month': datetime.now().strftime("%m-%y"),
+            'status': '0',
+            'suitFiledStatus': suit_filed_status
+        })
+
+    return normalized
+
+def normalize_api_enquiries(enquiries):
+    normalized = []
+    for enq in enquiries or []:
+        if not isinstance(enq, dict):
+            continue
+        date_str = parse_flexible_date(
+            enq.get('date') or enq.get('enquiryDate') or enq.get('applicationDate') or enq.get('inquiryDate')
+        )
+        lender = clean_str(
+            enq.get('lender') or enq.get('institution') or enq.get('InstitutionName') or enq.get('memberName') or enq.get('provider')
+        )
+        if date_str:
+            normalized.append({'date': date_str, 'lender': lender or 'Unknown'})
+    return normalized
+
+def normalize_api_account_status(status):
+    status_text = clean_str(status)
+    if not status_text:
+        return None
+    mapped = {
+        'ACTIVE': 'Current Account',
+        'CURRENT': 'Current Account',
+        'CLOSED': 'Closed Account'
+    }
+    return mapped.get(status_text.upper(), status_text)
+
+def normalize_positive_tenure(val):
+    cleaned = clean_str(val)
+    if cleaned is None:
+        return None
+    try:
+        numeric = float(cleaned)
+        if numeric <= 0:
+            return None
+        if numeric.is_integer():
+            return str(int(numeric))
+        return str(numeric)
+    except Exception:
+        return cleaned
+
+def build_api_raw_account_lookup(raw_report_data):
+    lookup = {}
+    if not isinstance(raw_report_data, dict):
+        return lookup
+
+    xml_report = raw_report_data.get('xmlJsonResponse', {})
+    accounts = xml_report.get('caisAccount', {}).get('caisAccountDetails', [])
+    if not isinstance(accounts, list):
+        return lookup
+
+    for raw_account in accounts:
+        if not isinstance(raw_account, dict):
+            continue
+        account_number = clean_str(raw_account.get('accountNumber'))
+        if account_number and account_number not in lookup:
+            lookup[account_number] = raw_account
+    return lookup
+
+def transform_api_account(account, raw_account):
+    if not isinstance(account, dict):
+        return None
+
+    raw_account = raw_account if isinstance(raw_account, dict) else {}
+    suit_filed_status = normalize_api_suit_filed_status(
+        raw_account.get('suitFiledWillfulDefaultWrittenOffStatus') or raw_account.get('suitFiledWilfulDefault')
+    )
+    payment_history = normalize_api_payment_history(account.get('paymentHistory', []), suit_filed_status=suit_filed_status)
+
+    credit_limit = clean_money(raw_account.get('creditLimitAmount'))
+    sanctioned_amount = credit_limit if credit_limit > 0 else clean_money(account.get('sanctioned'))
+    no_write_off_amount = clean_money(raw_account.get('originalChargeOffAmount'))
+    if no_write_off_amount <= 0:
+        no_write_off_amount = clean_money(raw_account.get('settlementAmount'))
+
+    detailed_emi = clean_money(account.get('emi'))
+    raw_emi = clean_money(raw_account.get('scheduledMonthlyPaymentAmount'))
+
+    transformed = {
+        'provider': clean_str(account.get('provider')) or clean_str(raw_account.get('subscriberName')),
+        'accountType': clean_str(account.get('productName')),
+        'sanctionedAmount': sanctioned_amount,
+        'totalSanctionAmt': clean_money(raw_account.get('highestCreditOrOrignalLoanAmount')),
+        'outstanding': clean_money(account.get('outstanding')),
+        'totalBalance': clean_money(raw_account.get('currentBalance')),
+        'paidPrincipal': clean_money(account.get('paidPrincipal')),
+        'emi': detailed_emi if detailed_emi > 0 else (raw_emi if raw_emi > 0 else 0),
+        'paymentHistory': payment_history,
+        'repaymentTenure': normalize_positive_tenure(raw_account.get('repaymentTenure')),
+        'accountOpenDate': parse_flexible_date(account.get('accountOpenDate') or raw_account.get('openDate')),
+        'accountCloseDate': parse_flexible_date(account.get('accountCloseDate') or raw_account.get('dateClosed')),
+        'accountStatus': normalize_api_account_status(account.get('accountStatus')),
+        'lastPaymentDate': parse_flexible_date(raw_account.get('dateOfLastPayment')),
+        'lastPaymentAmount': clean_money(raw_account.get('valueOfCreditsLastMonth')),
+        'accountPastDueAmount': clean_money(raw_account.get('amountPastDue')),
+        'writtenOffAmtTotal': clean_money(raw_account.get('writtenOffAmtTotal')),
+        'noWriteOff': no_write_off_amount
+    }
+
+    return transformed
+
+def build_qfinance_like_payload_from_api(report_data, raw_report_data, pan):
+    if not isinstance(report_data, dict):
+        return None
+
+    detailed_report = report_data.get('detailedReport', {})
+    if not isinstance(detailed_report, dict):
+        return None
+
+    raw_account_lookup = build_api_raw_account_lookup(raw_report_data)
+    transformed_credit_cards = []
+    transformed_loans = {}
+    transformed_other_loans = []
+    transformed_others = {}
+
+    for account in detailed_report.get('cards', []) or []:
+        transformed = transform_api_account(account, raw_account_lookup.get(clean_str(account.get('accountNumber'))))
+        if transformed:
+            transformed_credit_cards.append(transformed)
+
+    for loan_type, accounts in (detailed_report.get('loans') or {}).items():
+        if not isinstance(accounts, list):
+            continue
+        transformed_accounts = []
+        for account in accounts:
+            transformed = transform_api_account(account, raw_account_lookup.get(clean_str(account.get('accountNumber'))))
+            if transformed:
+                transformed_accounts.append(transformed)
+        if loan_type == 'otherLoans':
+            transformed_other_loans.extend(transformed_accounts)
+        else:
+            transformed_loans[loan_type] = transformed_accounts
+
+    for section_name, accounts in (detailed_report.get('others') or {}).items():
+        if not isinstance(accounts, list):
+            continue
+        transformed_accounts = []
+        for account in accounts:
+            transformed = transform_api_account(account, raw_account_lookup.get(clean_str(account.get('accountNumber'))))
+            if transformed:
+                transformed_accounts.append(transformed)
+        transformed_others[section_name] = transformed_accounts
+
+    enquiries = detailed_report.get('enquiries', {}) if isinstance(detailed_report.get('enquiries'), dict) else {}
+    normalized_recent = normalize_api_enquiries(enquiries.get('recent', []))
+    normalized_all = normalize_api_enquiries(enquiries.get('all', []))
+
+    summary = {}
+    if isinstance(enquiries.get('summary'), dict):
+        summary.update(enquiries.get('summary'))
+    total_caps_summary = raw_report_data.get('xmlJsonResponse', {}).get('totalCAPSSummary', {}) if isinstance(raw_report_data, dict) else {}
+    if isinstance(total_caps_summary, dict):
+        summary.setdefault('totalCAPSLast30Days', total_caps_summary.get('totalCAPSLast30Days'))
+        summary.setdefault('totalCAPSLast90Days', total_caps_summary.get('totalCAPSLast90Days'))
+
+    return {
+        'data': {
+            'reportData': {
+                'reportSummary': {
+                    'personalDetails': {'pan': pan},
+                    'enquiries': {
+                        'recent': normalized_recent,
+                        'all': normalized_all,
+                        'summary': summary
+                    }
+                },
+                'creditAnalysis': {
+                    'creditCards': transformed_credit_cards,
+                    'loans': transformed_loans,
+                    'otherLoans': transformed_other_loans,
+                    'others': transformed_others,
+                    'enquiries': {
+                        'recent': normalized_recent,
+                        'all': normalized_all,
+                        'summary': summary
+                    }
+                }
+            }
+        }
+    }
+
+def fetch_api_server_view_fallback_rows(cursor, report_ids, requested_pans):
+    if not report_ids:
+        return [], []
+
+    report_placeholders = _build_in_clause(report_ids)
+    tradelines_query = f"""
+        SELECT
+            pan,
+            Institution,
+            account_type,
+            Balance,
+            past_due_amount,
+            last_payment,
+            last_payment_date,
+            account_status,
+            sanction_amount,
+            credit_limit,
+            installment_amount,
+            repayment_tenure,
+            date_opened,
+            date_closed,
+            written_off_amt_total,
+            write_offs,
+            report_id
+        FROM api_server.vw1_customer_credit_lines
+        WHERE report_id IN ({report_placeholders})
+        ORDER BY pan, created_at DESC
+    """
+    cursor.execute(tradelines_query, report_ids)
+    tradeline_rows = cursor.fetchall()
+
+    rows_by_pan = {pan: [] for pan in requested_pans}
+    for (
+        pan, institution, account_type, balance, past_due_amount, last_payment,
+        last_payment_date, account_status, sanction_amount, credit_limit,
+        installment_amount, repayment_tenure, date_opened, date_closed,
+        written_off_amt_total, write_offs, report_id
+    ) in tradeline_rows:
+        normalized_pan = str(pan).strip().upper()
+        if normalized_pan not in rows_by_pan:
+            continue
+
+        sanctioned_amt = clean_money(credit_limit)
+        if sanctioned_amt <= 0:
+            sanctioned_amt = clean_money(sanction_amount)
+
+        outstanding_amt = clean_money(balance)
+        overdue_amount = clean_money(past_due_amount)
+        status_raw = clean_str(account_status)
+        written_off_amount = clean_money(written_off_amt_total)
+        written_off_flag = "Yes" if written_off_amount > 0 or clean_nullable_str(write_offs) else "No"
+
+        row = {
+            'pan': normalized_pan,
+            'fiName': clean_str(institution),
+            'creditLineType': clean_str(account_type),
+            'totalSanctionedAmount': sanctioned_amt,
+            'currentOutstanding': outstanding_amt,
+            'status': status_raw,
+            'SuitFiled': "No",
+            'SuitFiledStatus': None,
+            'WrittenOffFlag': written_off_flag,
+            'WrittenOffAmount': written_off_amount,
+            'paidPrincipalAmount': max(0, sanctioned_amt - outstanding_amt),
+            'EMI': clean_money(installment_amount),
+            'totalTenure': clean_str(repayment_tenure),
+            'pendingTenure': get_pending_tenure(repayment_tenure, parse_flexible_date(date_opened)),
+            'startDate': parse_flexible_date(date_opened),
+            'Balance': outstanding_amt,
+            'lastPaymentDate': parse_flexible_date(last_payment_date),
+            'lastPaymentAmount': clean_money(last_payment),
+            'accountPastDueAmount': overdue_amount,
+            'OverdueAmount': overdue_amount,
+            'totalDelinquencies': 0,
+            'delinquencies': '',
+            'delinquencies30Days': 0,
+            'delinquencies60Days': 0,
+            'delinquencies90Days': 0,
+            'Recent_Missed_30DPD': 0,
+            'Recent_Missed_60DPD': 0,
+            'Recent_Missed_90DPD': 0,
+            'Enq_30Days': 0,
+            'Enq_60Days': 0,
+            'Enq_90Days': 0,
+            'Enq_1Year': 0,
+            'currentDpd': overdue_amount,
+            'settledLast30Days': 0,
+            'settledLast60Days': 0,
+            'settledLast90Days': 0
+        }
+
+        rows_by_pan[normalized_pan].append(row)
+
+    all_rows = []
+    hits = []
+    for pan in requested_pans:
+        if rows_by_pan.get(pan):
+            all_rows.extend(rows_by_pan[pan])
+            hits.append(pan)
+
+    return all_rows, sorted(set(hits))
+
+def fetch_api_server_fallback_rows(cursor, specific_pans):
+    if not specific_pans:
+        return [], []
+
+    normalized_pans = [str(p).strip().upper() for p in specific_pans if p and str(p).strip()]
+    if not normalized_pans:
+        return [], []
+
+    placeholders = _build_in_clause(normalized_pans)
+    latest_reports_query = f"""
+        SELECT cr.panNumber, cr.id, cr.reportData, cr.rawReportData, cr.createdAt
+        FROM api_server.credit_reports cr
+        INNER JOIN (
+            SELECT UPPER(TRIM(panNumber)) AS pan_key, MAX(createdAt) AS max_created
+            FROM api_server.credit_reports
+            WHERE status = 'SUCCESS'
+              AND UPPER(TRIM(panNumber)) IN ({placeholders})
+            GROUP BY UPPER(TRIM(panNumber))
+        ) latest
+            ON UPPER(TRIM(cr.panNumber)) = latest.pan_key
+           AND cr.createdAt = latest.max_created
+        WHERE cr.status = 'SUCCESS'
+    """
+    cursor.execute(latest_reports_query, normalized_pans)
+    latest_reports = cursor.fetchall()
+
+    if not latest_reports:
+        return [], []
+
+    rows_by_pan = {}
+    report_ids = []
+    for pan, report_id, report_data_raw, raw_report_data_raw, _ in latest_reports:
+        normalized_pan = str(pan).strip().upper()
+        report_ids.append(report_id)
+        try:
+            report_data = json.loads(report_data_raw) if isinstance(report_data_raw, str) else report_data_raw
+            raw_report_data = json.loads(raw_report_data_raw) if isinstance(raw_report_data_raw, str) else raw_report_data_raw
+            transformed_payload = build_qfinance_like_payload_from_api(report_data, raw_report_data, normalized_pan)
+            rows_by_pan[normalized_pan] = process_single_record(transformed_payload, pan_from_db=normalized_pan)
+        except Exception:
+            rows_by_pan[normalized_pan] = []
+
+    unresolved_pans = [pan for pan in normalized_pans if not rows_by_pan.get(pan)]
+    if unresolved_pans:
+        view_rows, view_hits = fetch_api_server_view_fallback_rows(cursor, report_ids, unresolved_pans)
+        if view_hits:
+            view_map = {pan: [] for pan in view_hits}
+            for row in view_rows:
+                view_map[row['pan']].append(row)
+            for pan in view_hits:
+                rows_by_pan[pan] = view_map.get(pan, [])
+
+    all_rows = []
+    fallback_hits = []
+    for pan in normalized_pans:
+        if rows_by_pan.get(pan):
+            all_rows.extend(rows_by_pan[pan])
+            fallback_hits.append(pan)
+
+    return all_rows, sorted(set(fallback_hits))
+
 # ==========================================
 # CORE PROCESSING LOGIC (Single JSON Record)
 # ==========================================
@@ -236,6 +673,12 @@ def process_single_record(data_obj, pan_from_db=None):
              raw_enqs.extend(re_section.get('recent', []))
              raw_enqs.extend(re_section.get('all', []))
 
+        enquiry_summary = {}
+        if isinstance(ce_section, dict) and isinstance(ce_section.get('summary'), dict):
+            enquiry_summary.update(ce_section.get('summary'))
+        if isinstance(re_section, dict) and isinstance(re_section.get('summary'), dict):
+            enquiry_summary.update(re_section.get('summary'))
+
         unique_enqs_map = {}
         for enq in raw_enqs:
             if not isinstance(enq, dict): continue
@@ -247,10 +690,15 @@ def process_single_record(data_obj, pan_from_db=None):
                     unique_enqs_map[key] = enq
         
         enq_list = list(unique_enqs_map.values())
-        enq_30 = calculate_enquiries(enq_list, 30)
-        enq_60 = calculate_enquiries(enq_list, 60)
-        enq_90 = calculate_enquiries(enq_list, 90)
-        enq_365 = calculate_enquiries(enq_list, 365)
+        enq_30 = get_enquiry_summary_count(enquiry_summary, 'last30Days', 'last30', 'totalCAPSLast30Days')
+        enq_60 = get_enquiry_summary_count(enquiry_summary, 'last60Days', 'last60', 'totalCAPSLast60Days')
+        enq_90 = get_enquiry_summary_count(enquiry_summary, 'last90Days', 'last90', 'totalCAPSLast90Days')
+        enq_365 = get_enquiry_summary_count(enquiry_summary, 'last365Days', 'last1Year', 'totalCAPSLast365Days')
+
+        if enq_30 is None: enq_30 = calculate_enquiries(enq_list, 30)
+        if enq_60 is None: enq_60 = calculate_enquiries(enq_list, 60)
+        if enq_90 is None: enq_90 = calculate_enquiries(enq_list, 90)
+        if enq_365 is None: enq_365 = calculate_enquiries(enq_list, 365)
 
         # ACCOUNTS
         all_accounts = []
@@ -417,18 +865,17 @@ def run_processor(max_workers=20, specific_pans=None, progress_callback=None):
         cursor = conn.cursor()
         
         query = ""
+        query_params = None
         # 1. BUILD QUERY
         if specific_pans and len(specific_pans) > 0:
             msg = f"Fetching records for {len(specific_pans)} specific PANs..."
             print(msg)
             if progress_callback: progress_callback(0, 0, msg)
-            
-            # Sanitization for SQL IN clause
-            # (In production, consider cleaner param binding, but list injection is okay for this scope)
-            safe_pans = [p.replace("'", "") for p in specific_pans]
-            pan_list_str = "', '".join(safe_pans)
-            
-            query = f"SELECT pancardNumber, recommendationJsonFile FROM qfinance.q_report WHERE pancardNumber IN ('{pan_list_str}') ORDER BY createdAt DESC"
+
+            normalized_pans = [str(p).strip().upper() for p in specific_pans if p and str(p).strip()]
+            placeholders = _build_in_clause(normalized_pans)
+            query = f"SELECT pancardNumber, recommendationJsonFile FROM qfinance.q_report WHERE UPPER(TRIM(pancardNumber)) IN ({placeholders}) ORDER BY createdAt DESC"
+            query_params = normalized_pans
             
         else:
             msg = "Fetching ALL records from database..."
@@ -437,7 +884,7 @@ def run_processor(max_workers=20, specific_pans=None, progress_callback=None):
             
             query = "SELECT pancardNumber, recommendationJsonFile FROM qfinance.q_report ORDER BY createdAt DESC"
         
-        cursor.execute(query)
+        cursor.execute(query, query_params or ())
         records = cursor.fetchall()
         print(f"Found {len(records)} total records to process.")
         
@@ -459,37 +906,59 @@ def run_processor(max_workers=20, specific_pans=None, progress_callback=None):
         
         total_tasks = len(unique_tasks)
         print(f"Total Unique Valid Tasks to Process: {total_tasks}")
-        
-        if total_tasks == 0:
+
+        fallback_rows = []
+        fallback_pans = []
+        if specific_pans and len(specific_pans) > 0:
+            normalized_requested = [str(p).strip().upper() for p in specific_pans if p and str(p).strip()]
+            missing_pans = [p for p in normalized_requested if p not in seen_pans]
+            if missing_pans:
+                fallback_msg = f"Falling back to api_server for {len(missing_pans)} PAN(s) missing in qfinance..."
+                print(fallback_msg)
+                if progress_callback: progress_callback(0, max(total_tasks, 1), fallback_msg)
+                fallback_rows, fallback_pans = fetch_api_server_fallback_rows(cursor, missing_pans)
+                if fallback_pans:
+                    print(f"api_server fallback returned data for: {', '.join(fallback_pans)}")
+                else:
+                    print("api_server fallback returned no matching tradelines.")
+
+        if total_tasks == 0 and not fallback_rows:
             if progress_callback: progress_callback(0, 0, "No records found matching criteria.")
             conn.close()
             return None
 
-        if progress_callback: progress_callback(0, total_tasks, f"Starting Parallel Processing for {total_tasks} Tasks...")
+        if total_tasks > 0 and progress_callback:
+            progress_callback(0, total_tasks, f"Starting Parallel Processing for {total_tasks} Tasks...")
         
         # 3. PARALLEL EXECUTION
         start_time = time.time()
         
-        print(f"Starting {max_workers} parallel threads...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_pan = {executor.submit(fetch_and_process_task, task): task[0] for task in unique_tasks}
-            
-            for i, future in enumerate(concurrent.futures.as_completed(future_to_pan)):
-                pan = future_to_pan[future]
-                try:
-                    rows = future.result()
-                    all_final_rows.extend(rows)
-                    
-                    # Update Progress
-                    if progress_callback:
-                        msg = f"Processed {i+1}/{total_tasks}: {pan}"
-                        progress_callback(i+1, total_tasks, msg)
+        if total_tasks > 0:
+            print(f"Starting {max_workers} parallel threads...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_pan = {executor.submit(fetch_and_process_task, task): task[0] for task in unique_tasks}
+                
+                for i, future in enumerate(concurrent.futures.as_completed(future_to_pan)):
+                    pan = future_to_pan[future]
+                    try:
+                        rows = future.result()
+                        all_final_rows.extend(rows)
                         
-                    if (i + 1) % 50 == 0:
-                        print(f"Processed {i + 1}/{total_tasks} records...")
-                        
-                except Exception as exc:
-                    print(f"Task for {pan} generated an exception: {exc}")
+                        # Update Progress
+                        if progress_callback:
+                            msg = f"Processed {i+1}/{total_tasks}: {pan}"
+                            progress_callback(i+1, total_tasks, msg)
+                            
+                        if (i + 1) % 50 == 0:
+                            print(f"Processed {i + 1}/{total_tasks} records...")
+                            
+                    except Exception as exc:
+                        print(f"Task for {pan} generated an exception: {exc}")
+
+        if fallback_rows:
+            all_final_rows.extend(fallback_rows)
+            if progress_callback:
+                progress_callback(total_tasks, max(total_tasks, 1), f"api_server fallback added data for {len(fallback_pans)} PAN(s).")
                     
         elapsed_time = time.time() - start_time
         print(f"\nProcessing completed in {elapsed_time:.2f} seconds.")
