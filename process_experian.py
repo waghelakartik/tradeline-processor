@@ -611,6 +611,26 @@ def fetch_api_server_fallback_rows(cursor, specific_pans):
     if not latest_reports:
         return [], []
 
+    def has_meaningful_tradeline_rows(rows):
+        if not isinstance(rows, list) or not rows:
+            return False
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            if clean_nullable_str(row.get('fiName')) or clean_nullable_str(row.get('creditLineType')):
+                return True
+
+            if (
+                clean_money(row.get('totalSanctionedAmount')) > 0
+                or clean_money(row.get('currentOutstanding')) > 0
+                or clean_money(row.get('Balance')) > 0
+            ):
+                return True
+
+        return False
+
     rows_by_pan = {}
     report_ids = []
     for pan, report_id, report_data_raw, raw_report_data_raw, _ in latest_reports:
@@ -624,7 +644,7 @@ def fetch_api_server_fallback_rows(cursor, specific_pans):
         except Exception:
             rows_by_pan[normalized_pan] = []
 
-    unresolved_pans = [pan for pan in normalized_pans if not rows_by_pan.get(pan)]
+    unresolved_pans = [pan for pan in normalized_pans if not has_meaningful_tradeline_rows(rows_by_pan.get(pan))]
     if unresolved_pans:
         view_rows, view_hits = fetch_api_server_view_fallback_rows(cursor, report_ids, unresolved_pans)
         if view_hits:
